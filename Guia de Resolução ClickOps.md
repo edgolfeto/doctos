@@ -1,139 +1,143 @@
-# Guia Definitivo: Laboratório JuseByte (WorldSkills) - Do Zero ao Deploy
+# Resolução do Laboratório: Armazenamento Compartilhado e Provisionamento Automatizado (Ambiente Sandbox)
 
-Este é o seu manual completo e detalhado para resolver o laboratório de infraestrutura da JuseByte. Vamos construir a solução do absoluto zero, passo a passo, diretamente no Console da AWS, garantindo que você entenda o **porquê** de cada configuração.
+[cite_start]Este guia detalha a solução para o laboratório de implantação de uma aplicação web em Go[cite: 11], adaptada para ambientes restritos de Sandbox (sem permissões para IAM Roles e sem acesso ao Amazon EFS).
 
-O objetivo é criar uma arquitetura onde um balanceador de carga recebe o tráfego da internet e o distribui para instâncias EC2. Essas instâncias compartilharão um disco de rede (EFS) para uploads de arquivos e serão configuradas de forma 100% automatizada.
+## Arquitetura da Solução
 
----
-
-## Passo 1: Permissões Seguras (IAM Role)
-
-**O Problema:** O laboratório exige que a instância baixe o código do S3 sem usar credenciais ou chaves de acesso embutidas no script de inicialização.
-**A Solução:** Criar uma "Função" (Role) que a instância "vestirá" para ter permissão de ler o S3 nativamente.
-
-1. No console da AWS, busque por **IAM** e acesse o painel.
-2. No menu lateral esquerdo, clique em **Roles** (Funções) e depois no botão **Create role** (Criar função).
-3. Em "Trusted entity type", escolha **AWS service**.
-4. Em "Use case", escolha **EC2** e clique em **Next**.
-5. Na tela de permissões, pesquise por `AmazonS3ReadOnlyAccess`. Marque a caixa ao lado dessa política e clique em **Next**.
-6. Em "Role name", digite `JuseByte-EC2-Role`.
-7. Clique em **Create role** no final da página.
+Para contornar as restrições do ambiente, a arquitetura foi desenhada da seguinte forma:
+* **Application Load Balancer (ALB):** Ponto único de entrada, distribuindo o tráfego na porta 80.
+* **Instância EC2 (NFS Server):** Atua como o servidor de arquivos compartilhado, substituindo o EFS.
+* **Instâncias EC2 (Web Servers):** Executam a aplicação e são provisionadas automaticamente via *User Data*. [cite_start]Baixam o pacote via URL pública do S3 [cite: 55] (substituindo o uso de IAM Roles) e montam o diretório do servidor NFS localmente.
 
 ---
 
-## Passo 2: Isolamento de Rede (Security Groups)
+## Passo a Passo da Implementação
 
-**O Problema:** Precisamos garantir que ninguém acesse os servidores ou o banco de dados/arquivos diretamente pela internet, aplicando a regra do "menor privilégio".
-**A Solução:** Criar três Security Groups (firewalls virtuais) em cascata.
+### Passo 1: Configuração dos Security Groups (Menor Privilégio)
 
-1. Busque por **EC2** e acesse o painel. No menu lateral, em *Network & Security*, clique em **Security Groups** > **Create security group**.
+Você precisará criar três Grupos de Segurança (Security Groups) na mesma VPC:
 
-**2.1. Criando o SG do Balanceador (A porta de entrada):**
-*   **Nome:** `SG-ALB`
-*   **Descrição:** Permite acesso HTTP da internet.
-*   **Inbound rules (Regras de entrada):** Adicione uma regra do tipo **HTTP** (Porta 80), e em *Source* (Origem) escolha **Anywhere-IPv4** (`0.0.0.0/0`).
-*   Clique em **Create security group**.
+1. **SG-LoadBalancer:**
+   * **Inbound:** HTTP (80) de `0.0.0.0/0` (Internet).
+   * **Outbound:** Todo o tráfego permitido.
 
-**2.2. Criando o SG das Instâncias EC2 (A aplicação):**
-*   **Nome:** `SG-EC2`
-*   **Descrição:** Recebe tráfego apenas do Balanceador.
-*   **Inbound rules:** Adicione uma regra do tipo **HTTP** (Porta 80). Em *Source*, clique na caixa de busca e **selecione o `SG-ALB`** que você acabou de criar.
-*   Clique em **Create security group**.
+2. **SG-WebServers:**
+   * [cite_start]**Inbound:** HTTP (80) permitindo tráfego **apenas** com origem no `SG-LoadBalancer`[cite: 40].
+   * **Inbound:** SSH (22) do seu IP (apenas para *troubleshooting*, se necessário).
+   * **Outbound:** Todo o tráfego permitido.
 
-**2.3. Criando o SG do Armazenamento (O disco compartilhado):**
-*   **Nome:** `SG-EFS`
-*   **Descrição:** Permite a montagem do disco apenas pelas instâncias[cite: 1].
-*   **Inbound rules:** Adicione uma regra do tipo **NFS** (Porta 2049)[cite: 1]. Em *Source*, **selecione o `SG-EC2`** criado no passo anterior.
-*   Clique em **Create security group**.
+3. **SG-NFSServer:**
+   * [cite_start]**Inbound:** NFS (2049) permitindo tráfego **apenas** com origem no `SG-WebServers`[cite: 39].
+   * **Inbound:** SSH (22) do seu IP.
+   * **Outbound:** Todo o tráfego permitido.
 
 ---
 
-## Passo 3: Armazenamento Compartilhado (Amazon EFS)
+### Passo 2: Provisionamento do Armazenamento Compartilhado (Servidor NFS)
 
-**O Problema:** Um arquivo enviado para o Servidor A precisa ser lido pelo Servidor B[cite: 1]. Discos normais (EBS) são atrelados a uma única máquina[cite: 1].
-**A Solução:** Usar o Amazon Elastic File System (EFS), que funciona como uma pasta de rede compartilhada para Linux[cite: 1].
+Como não podemos usar o EFS, criaremos nosso próprio servidor NFS.
 
-1. Busque por **EFS** na barra de pesquisa superior e acesse o serviço.
-2. Clique no botão **Create file system** e, na janela que abrir, clique em **Customize** (para termos mais controle).
-3. **Passo 1 (Settings):** Dê um nome (ex: `JuseByte-Storage`). Em *Performance*, deixe as opções padrão. **Importante:** Certifique-se de que a opção **Enable encryption of data at rest** (Criptografia em repouso) esteja marcada[cite: 1]. Clique em **Next**.
-4. **Passo 2 (Network):** Aqui está o segredo. Você verá uma lista com suas Zonas de Disponibilidade (Subnets). Na coluna **Security groups**, remova o grupo "default" de todas as linhas e adicione o **`SG-EFS`** que criamos no Passo 2.
-5. Clique em **Next** até o final e depois em **Create**.
-6. **Atenção:** Na tela principal do seu novo EFS, anote o **File system ID** (ex: `fs-0abcd1234efgh5678`). Você precisará dele no script final.
+1. Inicie uma instância EC2 simples (ex: `t2.micro` com Amazon Linux 2023).
+2. Atribua a ela o **SG-NFSServer**.
+3. Acesse a instância via SSH e execute os comandos abaixo para configurar o NFS:
 
----
+\`\`\`bash
+sudo su
+dnf install nfs-utils -y
 
-## Passo 4: O Balanceador de Carga (Application Load Balancer)
+# Criar a pasta que será compartilhada
+mkdir -p /mnt/shared_uploads
+chmod -R 777 /mnt/shared_uploads
 
-**O Problema:** Distribuir os acessos dos clientes para instâncias saudáveis usando um único endereço[cite: 1].
-**A Solução:** Criar um Target Group (Grupo de Destino) e, em seguida, o Load Balancer (Balanceador).
+# Configurar as regras de exportação do NFS
+echo "/mnt/shared_uploads *(rw,sync,no_root_squash,no_subtree_check)" >> /etc/exports
 
-**4.1. Criando o Target Group (Quem recebe o tráfego?):**
-1. Volte ao painel do **EC2**. No menu lateral esquerdo, desça até *Load Balancing* e clique em **Target Groups** > **Create target group**.
-2. Em *Choose a target type*, selecione **Instances**.
-3. Em *Target group name*, digite `JuseByte-TG`. Protocolo: HTTP, Porta: 80.
-4. Em *Health checks*, deixe o caminho como `/`. (Isso diz ao balanceador para acessar a raiz do site e verificar se ele responde bem[cite: 1]).
-5. Clique em **Next** e, na tela seguinte (sem selecionar nenhuma instância por enquanto), clique em **Create target group**.
+# Iniciar e habilitar o serviço
+systemctl enable rpcbind nfs-server
+systemctl start rpcbind nfs-server
+exportfs -a
+\`\`\`
 
-**4.2. Criando o Load Balancer:**
-1. No menu lateral, clique em **Load Balancers** > **Create Load Balancer**.
-2. Em *Application Load Balancer*, clique em **Create**.
-3. **Nome:** `JuseByte-ALB`.
-4. **Scheme:** `Internet-facing` (para que os clientes possam acessá-lo da internet).
-5. **Network mapping:** Selecione sua VPC (geralmente a Default) e marque **pelo menos duas** zonas de disponibilidade (Availability Zones).
-6. **Security groups:** Remova o "default" e adicione o **`SG-ALB`**.
-7. **Listeners and routing:** Na porta HTTP 80, no campo *Default action*, selecione o grupo que criamos: **`JuseByte-TG`**.
-8. Vá até o final e clique em **Create load balancer**.
+> ⚠️ **IMPORTANTE:** Anote o **IP Privado** desta instância NFS (ex: `10.0.1.50`). Você precisará dele no próximo passo.
 
 ---
 
-## Passo 5: Automação Total (Launch Template e User Data)
+### Passo 3: Provisionamento Automatizado dos Web Servers (User Data)
 
-**O Problema:** Iniciar instâncias automaticamente, sem ninguém fazer login manual, já configuradas e prontas para rodar[cite: 1].
-**A Solução:** Criar um "Molde" (Launch Template) contendo o script mágico de inicialização (User Data).
+[cite_start]Agora vamos criar as instâncias que rodam a aplicação de forma 100% automatizada[cite: 43]. 
 
-1. No painel do **EC2**, clique em **Launch Templates** no menu lateral > **Create launch template**.
-2. **Nome:** `JuseByte-Template`. Marque a caixinha "Provide guidance...".
-3. **AMI (Sistema Operacional):** Clique em *Quick Start* e escolha **Amazon Linux 2023** ou Amazon Linux 2.
-4. **Instance type:** Selecione `t2.micro` (família x86) ou `t4g.micro` (família ARM).
-5. **Key pair:** Selecione *Proceed without a key pair* (Não precisamos de chave SSH, pois não faremos login manual! O laboratório proíbe intervenção pós-boot[cite: 1]).
-6. **Network settings:**
-   * Em *Firewall (security groups)*, selecione **Select existing security group**.
-   * Escolha o **`SG-EC2`**.
-7. **Advanced details (Aqui a mágica acontece):**
-   * Em **IAM instance profile**, selecione a role criada no Passo 1: **`JuseByte-EC2-Role`**.
-   * Role a tela até o final, até encontrar o campo **User data**. Copie e cole o código abaixo.
-   * **ATENÇÃO:** Substitua a palavra `ID_DO_SEU_EFS_AQUI` pelo ID que você anotou no Passo 3.
+1. Inicie duas instâncias EC2 (ex: `t2.micro` ou `t3.micro`).
+2. Atribua a elas o **SG-WebServers**.
+3. Em **Configurações Avançadas > User Data**, cole o script abaixo. **Lembre-se de substituir `<IP_PRIVADO_DO_NFS>` pelo IP que você anotou no Passo 2.**
 
-```bash
+\`\`\`bash
 #!/bin/bash
-# 1. Atualizar o sistema e instalar ferramentas basicas
-yum update -y
-yum install -y amazon-efs-utils unzip wget
+# 1. Atualizar e instalar dependências
+dnf update -y
+dnf install wget unzip nfs-utils -y
 
-# 2. Criar a pasta dos uploads e montar o disco compartilhado (EFS)
-# O parametro '-o tls' garante a criptografia em transito exigida pelo lab
-mkdir -p /mnt/uploads
-mount -t efs -o tls ID_DO_SEU_EFS_AQUI:/ /mnt/uploads
+# 2. Criar diretório da aplicação e ponto de montagem
+mkdir -p /var/www/jusebyte/uploads
+cd /var/www/jusebyte
 
-# 3. Preparar o ambiente para o site
-mkdir -p /opt/jusebyte
-cd /opt/jusebyte
+# 3. Montar o armazenamento compartilhado (NFS)
+# Substitua o IP abaixo pelo IP privado real do seu Servidor NFS
+NFS_SERVER_IP="<IP_PRIVADO_DO_NFS>"
+mount -t nfs $NFS_SERVER_IP:/mnt/shared_uploads /var/www/jusebyte/uploads
+echo "$NFS_SERVER_IP:/mnt/shared_uploads /var/www/jusebyte/uploads nfs defaults 0 0" >> /etc/fstab
 
-# 4. Baixar a aplicacao do bucket S3 do lab
-wget [https://worldskills.s3.us-east-1.amazonaws.com/br-pr-2026/lab2/site.zip](https://worldskills.s3.us-east-1.amazonaws.com/br-pr-2026/lab2/site.zip)
-unzip -o site.zip
+# 4. Baixar a aplicação via URL pública (Sem uso de IAM Roles)
+wget https://worldskills.s3.us-east-1.amazonaws.com/br-pr-2026/lab2/site.zip
+unzip site.zip
 
-# 5. Descobrir a arquitetura da maquina para rodar o arquivo certo
-# O comando uname -m retorna x86_64 ou aarch64
-ARQUITETURA=$(uname -m)
-
-if [ "$ARQUITETURA" == "x86_64" ]; then
-    EXECUTAVEL="site-linux-amd64"
-elif [ "$ARQUITETURA" == "aarch64" ]; then
-    EXECUTAVEL="site-linux-arm64"
+# 5. Detectar a arquitetura dinamicamente e dar permissão de execução
+ARCH=$(uname -m)
+if [ "$ARCH" == "x86_64" ]; then
+    BIN="site-linux-amd64"
+elif [ "$ARCH" == "aarch64" ]; then
+    BIN="site-linux-arm64"
 fi
+chmod +x $BIN
 
-# 6. Dar permissao para o sistema rodar o arquivo e inicia-lo
-# O 'nohup' e o '&' no final fazem o site rodar em segundo plano, liberando o script
-chmod +x ./$EXECUTAVEL
-nohup ./$EXECUTAVEL > log_aplicacao.txt 2>&1 &
+# 6. Criar serviço Systemd para manter a aplicação rodando em background na porta 80
+cat <<EOF > /etc/systemd/system/jusebyte.service
+[Unit]
+Description=JuseByte Web App
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/var/www/jusebyte
+# Executando o binário na porta 80 (parâmetro ilustrativo, ajuste conforme o --help da app)
+ExecStart=/var/www/jusebyte/$BIN -port 80
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# 7. Iniciar a aplicação
+systemctl daemon-reload
+systemctl enable jusebyte
+systemctl start jusebyte
+\`\`\`
+[cite_start]*(Nota de infraestrutura: O script acima avalia a arquitetura usando `uname -m` para executar o binário correto automaticamente[cite: 62].)*
+
+---
+
+### Passo 4: Configuração do Balanceador de Carga (ALB)
+
+1. Vá em **Target Groups** e crie um grupo do tipo *Instances*.
+2. [cite_start]Configure o *Health Check* (geralmente caminho `/` na porta 80, a depender da documentação da aplicação [cite: 25]).
+3. Registre as instâncias Web criadas no Passo 3.
+4. Vá em **Load Balancers** e crie um *Application Load Balancer*.
+5. Adicione um *Listener* na porta 80 e encaminhe o tráfego para o Target Group criado.
+6. Associe o ALB ao **SG-LoadBalancer**.
+
+---
+
+### Passo 5: Validação (Critérios de Sucesso)
+
+1. **Acesso:** Copie o DNS gerado pelo ALB e cole no navegador. [cite_start]O site deve carregar perfeitamente[cite: 47].
+2. [cite_start]**Consistência:** Faça o upload de um arquivo ou imagem[cite: 48]. Como as requisições estão sendo balanceadas, tente recarregar a página algumas vezes ou forçar o acesso a uma instância diferente. O arquivo continuará visível, provando que o NFS está operando com sucesso como sistema de arquivos centralizado.
